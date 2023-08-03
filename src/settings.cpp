@@ -3,6 +3,7 @@
 #include <cmath>  // for ceil, pow
 #include <limits> // for numeric_limits
 #include <string>
+//#include <filesystem>
 
 #include <fmt/core.h>
 #ifdef _OPENMP
@@ -30,6 +31,7 @@
 #include "openmc/volume_calc.h"
 #include "openmc/weight_windows.h"
 #include "openmc/xml_interface.h"
+#include "openmc/hdf5_interface.h"
 
 namespace openmc {
 
@@ -76,12 +78,17 @@ bool weight_windows_on {false};
 bool write_all_tracks {false};
 bool write_initial_source {false};
 
+bool survival_normalization {true};  // debug, new function
+bool source_file {false};
+
 std::string path_cross_sections;
 std::string path_input;
 std::string path_output;
 std::string path_particle_restart;
 std::string path_sourcepoint;
 std::string path_statepoint;
+const char* path_statepoint_c {path_statepoint.c_str()};
+std::string weight_windows_file;
 
 int32_t n_inactive {0};
 int32_t max_lost_particles {10};
@@ -121,6 +128,10 @@ int trigger_batch_interval {1};
 int verbosity {7};
 double weight_cutoff {0.25};
 double weight_survive {1.0};
+
+double weight_cutoff_fixed;
+double weight_survive_fixed;
+
 
 } // namespace settings
 
@@ -223,16 +234,11 @@ void read_settings_xml()
   std::string filename = settings::path_input + "settings.xml";
   if (!file_exists(filename)) {
     if (run_mode != RunMode::PLOTTING) {
-      fatal_error(
-        fmt::format("Settings XML file '{}' does not exist! In order "
-                    "to run OpenMC, you first need a set of input files; at a "
-                    "minimum, this "
-                    "includes settings.xml, geometry.xml, and materials.xml "
-                    "or a single XML file containing all of these files. "
-                    "Please consult "
-                    "the user's guide at https://docs.openmc.org for further "
-                    "information.",
-          filename));
+      fatal_error("Could not find any XML input files! In order to run OpenMC, "
+                  "you first need a set of input files; at a minimum, this "
+                  "includes settings.xml, geometry.xml, and materials.xml or a "
+                  "single model XML file. Please consult the user's guide at "
+                  "https://docs.openmc.org for further information.");
     } else {
       // The settings.xml file is optional if we just want to make a plot.
       return;
@@ -447,8 +453,9 @@ void read_settings_xml(pugi::xml_node root)
       auto path = get_node_value(node, "file", false, true);
       if (ends_with(path, ".mcpl") || ends_with(path, ".mcpl.gz")) {
         auto sites = mcpl_source_sites(path);
+        source_file = true;
         model::external_sources.push_back(make_unique<FileSource>(sites));
-      } else {
+      }else {
         model::external_sources.push_back(make_unique<FileSource>(path));
       }
     } else if (check_for_node(node, "library")) {
@@ -461,7 +468,7 @@ void read_settings_xml(pugi::xml_node root)
 
       // Create custom source
       model::external_sources.push_back(
-        make_unique<CustomSourceWrapper>(path, parameters));
+        make_unique<CompiledSourceWrapper>(path, parameters));
     } else {
       model::external_sources.push_back(make_unique<IndependentSource>(node));
     }
@@ -512,10 +519,16 @@ void read_settings_xml(pugi::xml_node root)
     xml_node node_cutoff = root.child("cutoff");
     if (check_for_node(node_cutoff, "weight")) {
       weight_cutoff = std::stod(get_node_value(node_cutoff, "weight"));
+      weight_cutoff_fixed = weight_cutoff;
     }
     if (check_for_node(node_cutoff, "weight_avg")) {
       weight_survive = std::stod(get_node_value(node_cutoff, "weight_avg"));
+      weight_survive_fixed = weight_survive;
     }
+    if(check_for_node(node_cutoff, "survival_normalization")){ 
+      survival_normalization = get_node_value_bool(node_cutoff, "survival_normalization");
+    }
+    
     if (check_for_node(node_cutoff, "energy_neutron")) {
       energy_cutoff[0] =
         std::stod(get_node_value(node_cutoff, "energy_neutron"));
@@ -908,11 +921,19 @@ void read_settings_xml(pugi::xml_node root)
   for (pugi::xml_node node_ww : root.children("weight_windows")) {
     variance_reduction::weight_windows.emplace_back(
       std::make_unique<WeightWindows>(node_ww));
-
-    // Enable weight windows by default if one or more are present
-    settings::weight_windows_on = true;
   }
 
+  // Enable weight windows by default if one or more are present
+  if (variance_reduction::weight_windows.size() > 0)
+    settings::weight_windows_on = true;
+
+  // read weight windows from file
+  if (check_for_node(root, "weight_windows_file")) {
+    weight_windows_file = get_node_value(root, "weight_windows_file");
+  }
+
+  // read settings for weight windows value, this will override
+  // the automatic setting even if weight windows are present
   if (check_for_node(root, "weight_windows_on")) {
     weight_windows_on = get_node_value_bool(root, "weight_windows_on");
   }
@@ -923,6 +944,24 @@ void read_settings_xml(pugi::xml_node root)
 
   if (check_for_node(root, "max_tracks")) {
     settings::max_tracks = std::stoi(get_node_value(root, "max_tracks"));
+  }
+
+  // Create weight window generator objects
+  if (check_for_node(root, "weight_window_generators")) {
+    auto wwgs_node = root.child("weight_window_generators");
+    for (pugi::xml_node node_wwg :
+      wwgs_node.children("weight_windows_generator")) {
+      variance_reduction::weight_windows_generators.emplace_back(
+        std::make_unique<WeightWindowsGenerator>(node_wwg));
+    }
+    // if any of the weight windows are intended to be generated otf, make sure
+    // they're applied
+    for (const auto& wwg : variance_reduction::weight_windows_generators) {
+      if (wwg->on_the_fly_) {
+        settings::weight_windows_on = true;
+        break;
+      }
+    }
   }
 }
 
@@ -976,7 +1015,6 @@ extern "C" int openmc_set_n_batches(
 
   return 0;
 }
-
 extern "C" int openmc_get_n_batches(int* n_batches, bool get_max_batches)
 {
   *n_batches = get_max_batches ? settings::n_max_batches : settings::n_batches;
